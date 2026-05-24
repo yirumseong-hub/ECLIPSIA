@@ -8,33 +8,23 @@
 //
 // ObjectPool 규칙 (CLAUDE.md §3):
 //   Enemy / Projectile / XPOrb / HPOrb는 반드시 각 Pool을 통해 생성/반환.
-//   직접 new Enemy() 등 호출 금지.
 //
 // 피해 계산 규칙 (CLAUDE.md §3):
 //   모든 피해는 반드시 DamageCalculator.calculate()를 거침.
 //
 // Ability 발동 규칙:
-//   abilityTimers(Map<id, ms>)로 쿨다운 관리.
-//   form=ZONE → fireZoneAbility (플레이어 중심 범위 피해)
-//   form=PROJECTILE → fireProjectileAbility (자동 조준 투사체)
-//   form=MELEE_HIT → fireMeleeHitAbility (lastDirection 기준 부채꼴 타격)
+//   form=ZONE       → fireZoneAbility
+//   form=PROJECTILE → fireProjectileAbility
+//   form=MELEE_HIT  → fireMeleeHitAbility
 //
-// 의존성:
-//   entities/Player.ts           > Player, WASDKeys
-//   entities/Enemy.ts            > Enemy
-//   entities/Projectile.ts       > Projectile
-//   entities/XPOrb.ts            > XPOrb
-//   entities/HPOrb.ts            > HPOrb
-//   entities/mechanics/OverheatMechanic.ts > OverheatMechanic
-//   abilities/AbilityData.ts     > AbilityData, ALL_ABILITIES, ATTRIBUTE_COLORS, LevelStats
-//   abilities/AbilityManager.ts  > AbilityManager, AbilitySlot
-//   systems/DamageCalculator.ts  > calculate
-//   systems/LevelUpManager.ts    > LevelUpManager, Choice
-//   systems/DropManager.ts       > DropManager
-//   ui/LevelUpUI.ts              > LevelUpUI
-//   data/characters.ts           > ARA_DATA
-//   data/enemies.ts              > GRUNT_DATA, ARMORED_GRUNT_DATA, SPITTER_DATA, EnemyData
-//   utils/ObjectPool.ts          > ObjectPool
+// Overheat 연동 (Block 5 추가):
+//   FIRE Ability 발동 전  → consumeOverheat(): true면 ×2 dmg / ×1.5 area
+//   FIRE Ability 발동 후  → addHeat()
+//
+// Champion (Stone Warden):
+//   championSet / championTimers로 관리.
+//   3초마다 충격파(넉백) 발사. HP<50% 시 이속 1.5배.
+//   처치 시 Relic Box 시각 표시 + 드롭.
 // ============================================================
 
 import Phaser from 'phaser';
@@ -43,7 +33,7 @@ import { Enemy } from '../entities/Enemy';
 import { Projectile } from '../entities/Projectile';
 import { XPOrb } from '../entities/XPOrb';
 import { HPOrb } from '../entities/HPOrb';
-import { OverheatMechanic } from '../entities/mechanics/OverheatMechanic';
+import { OverheatMechanic, OVERHEAT_DAMAGE_MULT, OVERHEAT_AREA_MULT } from '../entities/mechanics/OverheatMechanic';
 import {
   AbilityData,
   ALL_ABILITIES,
@@ -54,15 +44,13 @@ import {
 import { AbilityManager, AbilitySlot } from '../abilities/AbilityManager';
 import { LevelUpManager, Choice } from '../systems/LevelUpManager';
 import { LevelUpUI } from '../ui/LevelUpUI';
+import { HUDData, SlotDisplayData } from '../ui/HUD';
 import { calculate } from '../systems/DamageCalculator';
 import { DropManager } from '../systems/DropManager';
+import { WaveManager } from '../systems/WaveManager';
 import { ARA_DATA } from '../data/characters';
-import {
-  GRUNT_DATA,
-  ARMORED_GRUNT_DATA,
-  SPITTER_DATA,
-  EnemyData,
-} from '../data/enemies';
+import { STONE_WARDEN_DATA, EnemyData } from '../data/enemies';
+import { AttributeCard } from '../data/attributeCards';
 import { ObjectPool } from '../utils/ObjectPool';
 
 // ── 전투 상수 (임시값 — CLAUDE.md §15) ──────────────────────
@@ -78,65 +66,84 @@ const XP_ABSORB_SPEED  = 150;
 const HP_ABSORB_RADIUS = 80;
 const HP_ABSORB_SPEED  = 120;
 
-// ── 테스트 스폰 설정 (Block 5에서 WaveManager로 교체) ─────────
-const TEST_SPAWN_COUNT = 16;
-const MIN_SPAWN_DIST   = 200;
-
 // ── Spitter AI 상수 (임시값 — CLAUDE.md §15) ─────────────────
-// 이 거리 미만 → 도주, 이하 → 정지+사격, 초과 → 추격
-const SPITTER_FLEE_DIST       = 160;
-const SPITTER_SHOOT_DIST      = 320;
-const SPITTER_SHOOT_COOLDOWN  = 2500; // ms
-const SPITTER_PROJ_SPEED      = 200;  // px/s
+const SPITTER_FLEE_DIST      = 160;
+const SPITTER_SHOOT_DIST     = 320;
+const SPITTER_SHOOT_COOLDOWN = 2500; // ms
+const SPITTER_PROJ_SPEED     = 200;  // px/s
+
+// ── Champion (Stone Warden) 상수 ─────────────────────────────
+const CHAMPION_SHOCKWAVE_COOLDOWN   = 3000; // ms
+const CHAMPION_SPEED_BOOST_RATIO    = 1.5;
+const CHAMPION_HP_BOOST_THRESHOLD   = 0.5;
+
+// ── Stage 상수 ────────────────────────────────────────────────
+const STAGE_DURATION_SEC     = 420; // 7분
+const CHAMPION_CHECK_TIMES   = [150, 300] as const; // 2:30 / 5:00
+const CHAMPION_SPAWN_CHANCE  = 0.75;
 
 export class GameScene extends Phaser.Scene {
   // ── 엔티티 ───────────────────────────────────────────────
   private player!: Player;
 
   // ── ObjectPool (CLAUDE.md §3: 풀링 필수) ─────────────────
-  private enemyPool!: ObjectPool<Enemy>;
-  private projectilePool!: ObjectPool<Projectile>;        // 플레이어 투사체
-  private xpOrbPool!: ObjectPool<XPOrb>;
-  private hpOrbPool!: ObjectPool<HPOrb>;
-  private enemyProjectilePool!: ObjectPool<Projectile>;   // 적 투사체 (Spitter 전용)
+  private enemyPool!:           ObjectPool<Enemy>;
+  private projectilePool!:      ObjectPool<Projectile>;
+  private xpOrbPool!:           ObjectPool<XPOrb>;
+  private hpOrbPool!:           ObjectPool<HPOrb>;
+  private enemyProjectilePool!: ObjectPool<Projectile>;
 
   // ── Phaser Physics Group ──────────────────────────────────
-  private enemyGroup!: Phaser.Physics.Arcade.Group;
-  private projectileGroup!: Phaser.Physics.Arcade.Group;
-  private xpOrbGroup!: Phaser.Physics.Arcade.Group;
-  private hpOrbGroup!: Phaser.Physics.Arcade.Group;
+  private enemyGroup!:           Phaser.Physics.Arcade.Group;
+  private projectileGroup!:      Phaser.Physics.Arcade.Group;
+  private xpOrbGroup!:           Phaser.Physics.Arcade.Group;
+  private hpOrbGroup!:           Phaser.Physics.Arcade.Group;
   private enemyProjectileGroup!: Phaser.Physics.Arcade.Group;
 
   // ── 입력 ─────────────────────────────────────────────────
   private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
-  private wasd!: WASDKeys;
+  private wasd!:    WASDKeys;
 
   // ── 타이머 ───────────────────────────────────────────────
-  // Normal Attack 쿨다운 (ms)
   private normalAttackTimer: number = 0;
-  // Ability 쿨다운: abilityId → 남은 시간(ms). 0 이하 시 발동.
-  private abilityTimers: Map<string, number> = new Map();
-  // Spitter 사격 쿨다운: enemy 인스턴스 → 남은 시간(ms).
-  private spitterTimers: Map<Enemy, number> = new Map();
+  private abilityTimers:     Map<string, number> = new Map();
+  private abilityCooldowns:  Map<string, number> = new Map(); // full CD (ms)
+  private spitterTimers:     Map<Enemy, number>  = new Map();
 
   // ── Ability 시스템 ────────────────────────────────────────
   private abilityManager!: AbilityManager;
   private levelUpManager!: LevelUpManager;
-  private levelUpUI!: LevelUpUI;
+  private levelUpUI!:      LevelUpUI;
 
-  // ── XP / 레벨 시스템 ─────────────────────────────────────
+  // ── XP / 레벨 / Gold ─────────────────────────────────────
   private playerLevel: number = 1;
   private playerXP:    number = 0;
   private playerGold:  number = 0;
 
-  // 레벨업 UI 표시 중 true. update() 조기 반환으로 게임 로직 정지.
-  private isLevelingUp: boolean = false;
+  // ── Attribute Card 피해 보너스 ────────────────────────────
+  // attribute → 누적 PERCENT 보너스 (값 12 = +12%)
+  private attributeDmgBonuses: Map<string, number> = new Map();
 
-  // 슬롯 꽉 찬 상태에서 선택한 Ability — Discard 후 자동 장착 대기.
+  // ── WaveManager ──────────────────────────────────────────
+  private waveManager!: WaveManager;
+
+  // ── Stage 타이머 ─────────────────────────────────────────
+  private stageElapsedSeconds: number = 0;
+  private stageNumber:         number = 1;
+
+  // ── Champion 관리 ────────────────────────────────────────
+  private championCheckDone: [boolean, boolean] = [false, false];
+  private championSet:    Set<Enemy>         = new Set();
+  private championTimers: Map<Enemy, number> = new Map();
+  private shockwaveSet:   Set<Projectile>    = new Set();
+
+  // ── 게임 상태 ─────────────────────────────────────────────
+  private isLevelingUp:   boolean = false;
+  private isGameOver:     boolean = false;
+  private stageCompleted: boolean = false;
+
+  // Discard 후 장착 대기 중인 Ability
   private pendingAbility: AbilityData | null = null;
-
-  // ── 디버그 표시 (UIScene HUD 구현 전 임시) ──────────────────
-  private debugText!: Phaser.GameObjects.Text;
 
   constructor() {
     super({ key: 'GameScene' });
@@ -150,10 +157,10 @@ export class GameScene extends Phaser.Scene {
     // ① 텍스처 사전 생성 (Pool factory 이전에 반드시 먼저 호출)
     this.generateGameTextures();
 
-    // ② 아케이드 물리 월드 경계 설정
+    // ② 아케이드 물리 월드 경계
     this.physics.world.setBounds(0, 0, width, height);
 
-    // ③ 맵 배경 + 경계선 (임시 그래픽, CLAUDE.md §16)
+    // ③ 맵 배경 + 경계선
     this.add.rectangle(width / 2, height / 2, width, height, 0x1a1a2e);
     const border = this.add.graphics();
     border.lineStyle(2, 0x4444aa, 0.8);
@@ -169,29 +176,23 @@ export class GameScene extends Phaser.Scene {
     // ⑤ ObjectPool 초기화
     this.enemyPool = new ObjectPool<Enemy>(
       () => { const e = new Enemy(this); this.enemyGroup.add(e); return e; },
-      () => {},
-      20,
+      () => {}, 20,
     );
     this.projectilePool = new ObjectPool<Projectile>(
       () => { const p = new Projectile(this); this.projectileGroup.add(p); return p; },
-      () => {},
-      40,
+      () => {}, 40,
     );
     this.xpOrbPool = new ObjectPool<XPOrb>(
       () => { const o = new XPOrb(this); this.xpOrbGroup.add(o); return o; },
-      () => {},
-      30,
+      () => {}, 30,
     );
     this.hpOrbPool = new ObjectPool<HPOrb>(
       () => { const o = new HPOrb(this); this.hpOrbGroup.add(o); return o; },
-      () => {},
-      10,
+      () => {}, 10,
     );
-    // 적 투사체 풀 — enemyProjectileGroup에만 속함 (playerGroup과 overlap만 설정)
     this.enemyProjectilePool = new ObjectPool<Projectile>(
       () => { const p = new Projectile(this); this.enemyProjectileGroup.add(p); return p; },
-      () => {},
-      20,
+      () => {}, 20,
     );
 
     // ⑥ 플레이어 생성
@@ -202,7 +203,6 @@ export class GameScene extends Phaser.Scene {
     this.levelUpManager = new LevelUpManager();
     this.levelUpUI      = new LevelUpUI(this);
 
-    // 캐릭터 Starting Ability 자동 장착 (Ara: flame_burst)
     const startId = ARA_DATA.startingAbilityId;
     if (startId) {
       const startAbility = ALL_ABILITIES.find(a => a.id === startId);
@@ -210,37 +210,26 @@ export class GameScene extends Phaser.Scene {
     }
 
     // ⑧ Physics Overlap 설정
-    // 플레이어 투사체 ↔ 적
     this.physics.add.overlap(
-      this.projectileGroup,
-      this.enemyGroup,
+      this.projectileGroup, this.enemyGroup,
       (a, b) => this.handleProjectileHitEnemy(
-        a as unknown as Projectile,
-        b as unknown as Enemy,
+        a as unknown as Projectile, b as unknown as Enemy,
       ),
     );
-    // 플레이어 ↔ 적 (접촉 피해)
     this.physics.add.overlap(
-      this.player,
-      this.enemyGroup,
+      this.player, this.enemyGroup,
       (_p, b) => this.handlePlayerHitEnemy(b as Enemy),
     );
-    // 플레이어 ↔ XP 오브
     this.physics.add.overlap(
-      this.player,
-      this.xpOrbGroup,
+      this.player, this.xpOrbGroup,
       (_p, o) => this.handlePlayerCollectXP(o as XPOrb),
     );
-    // 플레이어 ↔ HP 오브
     this.physics.add.overlap(
-      this.player,
-      this.hpOrbGroup,
+      this.player, this.hpOrbGroup,
       (_p, o) => this.handlePlayerCollectHP(o as HPOrb),
     );
-    // 적 투사체 ↔ 플레이어
     this.physics.add.overlap(
-      this.player,
-      this.enemyProjectileGroup,
+      this.player, this.enemyProjectileGroup,
       (_p, b) => this.handleEnemyProjectileHitPlayer(b as Projectile),
     );
 
@@ -253,20 +242,33 @@ export class GameScene extends Phaser.Scene {
       right: this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.D),
     };
 
-    // ⑩ 디버그 텍스트 (우상단 임시)
-    this.debugText = this.add.text(width - 8, 8, '', {
-      fontSize: '13px', color: '#ffffff',
-    }).setOrigin(1, 0).setDepth(50);
+    // ⑩ WaveManager (spawnTestEnemies 대체)
+    this.waveManager = new WaveManager(
+      this,
+      (x, y, data) => this.spawnEnemy(x, y, data),
+    );
 
-    // ⑪ 테스트 적 스폰
-    this.spawnTestEnemies();
-
-    // ⑫ UI 씬 병렬 실행
-    this.scene.launch('UIScene');
+    // ⑪ UI 씬 병렬 실행
+    if (!this.scene.isActive('UIScene')) {
+      this.scene.launch('UIScene');
+    }
   }
 
   update(time: number, delta: number): void {
+    // 게임 종료 / 스테이지 클리어 시 완전 정지
+    if (this.isGameOver || this.stageCompleted) return;
+
+    // HUD 갱신은 레벨업 UI 표시 중에도 계속 (HP/XP 등 변하지 않지만 일관성 유지)
+    this.emitHUDUpdate();
+
+    // 레벨업 UI 중에는 나머지 게임 로직 정지
     if (this.isLevelingUp) return;
+
+    // 게임 오버 체크 (HP=0)
+    if (this.player.isDead()) {
+      this.triggerGameOver();
+      return;
+    }
 
     this.player.update(this.cursors, this.wasd, time, delta);
     this.updateEnemies(delta);
@@ -276,22 +278,72 @@ export class GameScene extends Phaser.Scene {
     this.updateHPOrbAttraction();
     this.cleanupOutOfBoundsProjectiles();
 
-    // 디버그: 레벨 / XP / Gold / HP 표시
-    const threshold = this.getXPThreshold(this.playerLevel);
-    this.debugText.setText(
-      `Lv.${this.playerLevel}  XP:${this.playerXP}/${threshold}` +
-      `  Gold:${this.playerGold}  HP:${this.player.hp}/${this.player.maxHp}`,
-    );
+    // Stage 타이머 + 웨이브 스폰
+    this.stageElapsedSeconds += delta / 1000;
+    this.checkChampionSpawn();
+    this.waveManager.update(delta);
+
+    // Stage 클리어 체크 (7분 경과)
+    if (this.stageElapsedSeconds >= STAGE_DURATION_SEC) {
+      this.showStageComplete();
+    }
+  }
+
+  // ── HUD 이벤트 발행 ────────────────────────────────────────
+
+  private emitHUDUpdate(): void {
+    const mechanic = this.player.mechanic as OverheatMechanic | null;
+    this.events.emit('hud-update', {
+      hp:            this.player.hp,
+      maxHp:         this.player.maxHp,
+      level:         this.playerLevel,
+      xp:            this.playerXP,
+      xpThreshold:   this.getXPThreshold(this.playerLevel),
+      gold:          this.playerGold,
+      elapsedTime:   this.stageElapsedSeconds,
+      stageNumber:   this.stageNumber,
+      overheatValue: mechanic?.getGaugeValue()        ?? 0,
+      overheatMax:   mechanic?.getGaugeMax()           ?? 0,
+      isOverheated:  mechanic?.isCurrentlyOverheated() ?? false,
+      slots:         this.buildSlotDisplayData(),
+      playerX:       this.player.x,
+      playerY:       this.player.y,
+    } as HUDData);
+  }
+
+  private buildSlotDisplayData(): SlotDisplayData[] {
+    const slots = this.abilityManager.getSlots();
+    const result: SlotDisplayData[] = [];
+    for (let i = 0; i < 6; i++) {
+      const slot = i < slots.length ? slots[i] : null;
+      if (!slot) {
+        result.push({ isEmpty: true, abilityName: null, levelLabel: null, colorHex: 0, cooldownRatio: 0 });
+        continue;
+      }
+      const id       = slot.ability.id;
+      const fullCd   = this.abilityCooldowns.get(id) ?? 0;
+      const remain   = Math.max(0, this.abilityTimers.get(id) ?? 0);
+      const ratio    = fullCd > 0 ? Math.min(1, remain / fullCd) : 0;
+      result.push({
+        isEmpty:       false,
+        abilityName:   slot.ability.name,
+        levelLabel:    `Lv.${slot.level}`,
+        colorHex:      ATTRIBUTE_COLORS[slot.ability.attribute],
+        cooldownRatio: ratio,
+      });
+    }
+    return result;
   }
 
   // ── 프레임 업데이트: 적 AI ────────────────────────────────
 
-  // Spitter는 별도 AI, 나머지는 단순 추격.
   private updateEnemies(delta: number): void {
     for (const child of this.enemyGroup.getChildren()) {
       const enemy = child as Enemy;
       if (!enemy.active) continue;
-      if (enemy.enemyData?.id === 'spitter') {
+      if (this.championSet.has(enemy)) {
+        this.updateChampionAI(enemy, delta);
+      } else if (enemy.enemyData?.id === 'spitter') {
         this.updateSpitterAI(enemy, delta);
       } else {
         enemy.chasePlayer(this.player.x, this.player.y);
@@ -299,25 +351,15 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
-  // Spitter AI:
-  //   dist < FLEE_DIST      → 도주 (플레이어 반대 방향)
-  //   FLEE_DIST~SHOOT_DIST  → 정지 + 주기적 투사체 발사
-  //   dist > SHOOT_DIST     → 플레이어 추격
   private updateSpitterAI(spitter: Enemy, delta: number): void {
-    const dist = Phaser.Math.Distance.Between(
-      spitter.x, spitter.y, this.player.x, this.player.y,
-    );
-    const body = spitter.body as Phaser.Physics.Arcade.Body;
+    const dist  = Phaser.Math.Distance.Between(spitter.x, spitter.y, this.player.x, this.player.y);
+    const body  = spitter.body as Phaser.Physics.Arcade.Body;
     const speed = spitter.enemyData?.moveSpeed ?? 80;
 
     if (dist < SPITTER_FLEE_DIST) {
-      // 플레이어 반대 방향으로 도주
-      const angle = Phaser.Math.Angle.Between(
-        this.player.x, this.player.y, spitter.x, spitter.y,
-      );
+      const angle = Phaser.Math.Angle.Between(this.player.x, this.player.y, spitter.x, spitter.y);
       body.setVelocity(Math.cos(angle) * speed, Math.sin(angle) * speed);
     } else if (dist <= SPITTER_SHOOT_DIST) {
-      // 정지 후 사격 쿨다운 처리
       body.setVelocity(0, 0);
       const remaining = (this.spitterTimers.get(spitter) ?? 0) - delta;
       if (remaining <= 0) {
@@ -327,25 +369,50 @@ export class GameScene extends Phaser.Scene {
         this.spitterTimers.set(spitter, remaining);
       }
     } else {
-      // 추격
       spitter.chasePlayer(this.player.x, this.player.y);
     }
   }
 
-  // Spitter가 플레이어 방향으로 투사체 발사.
+  // Stone Warden AI: 플레이어 추격 + 주기적 충격파 + HP<50% 가속
+  private updateChampionAI(champion: Enemy, delta: number): void {
+    const hpRatio  = champion.maxHp > 0 ? champion.hp / champion.maxHp : 1;
+    const base     = champion.enemyData?.moveSpeed ?? 60;
+    const speed    = hpRatio < CHAMPION_HP_BOOST_THRESHOLD ? base * CHAMPION_SPEED_BOOST_RATIO : base;
+    const angle    = Phaser.Math.Angle.Between(champion.x, champion.y, this.player.x, this.player.y);
+    (champion.body as Phaser.Physics.Arcade.Body).setVelocity(
+      Math.cos(angle) * speed, Math.sin(angle) * speed,
+    );
+
+    const remaining = (this.championTimers.get(champion) ?? 0) - delta;
+    if (remaining <= 0) {
+      this.fireChampionShockwave(champion);
+      this.championTimers.set(champion, CHAMPION_SHOCKWAVE_COOLDOWN);
+    } else {
+      this.championTimers.set(champion, remaining);
+    }
+  }
+
+  // Stone Warden 충격파: 적 투사체 풀 사용 + shockwaveSet 등록
+  private fireChampionShockwave(champion: Enemy): void {
+    const proj  = this.enemyProjectilePool.get();
+    const angle = Phaser.Math.Angle.Between(champion.x, champion.y, this.player.x, this.player.y);
+    const speed = 280;
+    proj.activate(
+      champion.x, champion.y,
+      Math.cos(angle) * speed, Math.sin(angle) * speed,
+      champion.enemyData?.damage ?? 20,
+      'PHYSICAL', 0, 'shockwave_tex',
+    );
+    this.shockwaveSet.add(proj);
+  }
+
   private fireSpitterProjectile(spitter: Enemy): void {
     const proj  = this.enemyProjectilePool.get();
-    const angle = Phaser.Math.Angle.Between(
-      spitter.x, spitter.y, this.player.x, this.player.y,
-    );
+    const angle = Phaser.Math.Angle.Between(spitter.x, spitter.y, this.player.x, this.player.y);
     proj.activate(
       spitter.x, spitter.y,
-      Math.cos(angle) * SPITTER_PROJ_SPEED,
-      Math.sin(angle) * SPITTER_PROJ_SPEED,
-      spitter.enemyData?.damage ?? 8,
-      'PHYSICAL',
-      0,
-      'proj_physical_tex',
+      Math.cos(angle) * SPITTER_PROJ_SPEED, Math.sin(angle) * SPITTER_PROJ_SPEED,
+      spitter.enemyData?.damage ?? 8, 'PHYSICAL', 0, 'proj_physical_tex',
     );
   }
 
@@ -363,33 +430,27 @@ export class GameScene extends Phaser.Scene {
     if (!speed) return;
 
     this.fireProjectile(
-      this.player.x, this.player.y,
-      target.x, target.y,
-      na.stats.damage,
-      na.attribute,
-      speed,
+      this.player.x, this.player.y, target.x, target.y,
+      na.stats.damage, na.attribute, speed,
       na.attackShape.pierce ?? 0,
       `proj_${na.attribute.toLowerCase()}_tex`,
     );
-
     this.normalAttackTimer = na.cooldown * 1000;
   }
 
   // ── 프레임 업데이트: Ability 발동 ─────────────────────────
 
-  // 장착된 모든 Ability의 쿨다운을 delta로 감산.
-  // 쿨다운 만료 시 fireAbility() 호출 후 쿨다운 리셋.
   private updateAbilities(delta: number): void {
-    const equipped = this.abilityManager.getEquippedAbilities();
-    for (const slot of equipped) {
+    for (const slot of this.abilityManager.getEquippedAbilities()) {
       const id      = slot.ability.id;
       const current = this.abilityTimers.get(id) ?? 0;
       const next    = current - delta;
       if (next <= 0) {
         this.fireAbility(slot);
-        const stats       = slot.ability.stats[slot.level - 1];
-        const cooldownSec = stats.cooldown ?? slot.ability.cooldown ?? 2;
-        this.abilityTimers.set(id, cooldownSec * 1000);
+        const stats      = slot.ability.stats[slot.level - 1];
+        const cdMs       = (stats.cooldown ?? slot.ability.cooldown ?? 2) * 1000;
+        this.abilityTimers.set(id, cdMs);
+        this.abilityCooldowns.set(id, cdMs); // HUD 쿨다운 표시용
       } else {
         this.abilityTimers.set(id, next);
       }
@@ -397,48 +458,60 @@ export class GameScene extends Phaser.Scene {
   }
 
   // Ability 발동 진입점.
-  // Ara 고유 패시브 적용 후 attackShape.form에 따라 분기.
+  // Ara 패시브 + Attribute Card 보너스 + Overheat 연동 후 form 분기.
   private fireAbility(slot: AbilitySlot): void {
     const stats  = slot.ability.stats[slot.level - 1];
     const rawDmg = stats.damage ?? 0;
 
-    // Ara 고유 패시브: 광기의 불꽃 (CLAUDE.md §13)
-    // FIRE Ability 2개 이상 보유 시 FIRE 피해 +15%
+    // Ara 고유 패시브: 광기의 불꽃
     const araBonus = slot.ability.attribute === 'FIRE'
       ? this.player.getFirePassiveBonus(this.abilityManager.countByAttribute('FIRE'))
       : 0;
-    const araFactor = 1 + araBonus;
+
+    // Attribute Card PERCENT 보너스
+    const attrBonus  = this.attributeDmgBonuses.get(slot.ability.attribute) ?? 0;
+    const combined   = 1 + araBonus + attrBonus / 100;
+
+    // Overheat: FIRE Ability 발동 직전 체크
+    let overheatDmgMult  = 1;
+    let overheatAreaMult = 1;
+    if (slot.ability.attribute === 'FIRE') {
+      const mech = this.player.mechanic as OverheatMechanic | null;
+      if (mech?.consumeOverheat()) {
+        overheatDmgMult  = OVERHEAT_DAMAGE_MULT;
+        overheatAreaMult = OVERHEAT_AREA_MULT;
+      }
+    }
 
     const form = slot.ability.attackShape?.form;
-
     if (form === 'ZONE') {
-      // ZONE: 발동 시 calculate까지 즉시 처리 → damageMultiplier 포함한 baseDmg
-      const baseDmg = rawDmg * araFactor * this.player.characterData.damageMultiplier;
-      this.fireZoneAbility(slot, stats, baseDmg);
+      const baseDmg = rawDmg * combined * this.player.characterData.damageMultiplier * overheatDmgMult;
+      this.fireZoneAbility(slot, stats, baseDmg, overheatAreaMult);
     } else if (form === 'PROJECTILE') {
-      // PROJECTILE: proj.damage로 저장 → handleProjectileHitEnemy에서 damageMultiplier 적용
-      const projDmg = rawDmg * araFactor;
+      const projDmg = rawDmg * combined * overheatDmgMult;
       this.fireProjectileAbility(slot, stats, projDmg);
     } else if (form === 'MELEE_HIT') {
-      const baseDmg = rawDmg * araFactor * this.player.characterData.damageMultiplier;
-      this.fireMeleeHitAbility(slot, stats, baseDmg);
+      const baseDmg = rawDmg * combined * this.player.characterData.damageMultiplier * overheatDmgMult;
+      this.fireMeleeHitAbility(slot, stats, baseDmg, overheatAreaMult);
+    }
+
+    // Overheat: FIRE Ability 발동 후 heat 누적
+    if (slot.ability.attribute === 'FIRE') {
+      const mech = this.player.mechanic as OverheatMechanic | null;
+      mech?.addHeat();
     }
   }
 
-  // ZONE: 플레이어 중심 원형 범위 내 모든 적에게 피해.
-  // 루프 도중 死亡 처리를 막기 위해 toKill 배열로 모아 루프 후 일괄 처리.
-  private fireZoneAbility(slot: AbilitySlot, stats: LevelStats, baseDmg: number): void {
-    const radius  = stats.area ?? 80;
-    const color   = ATTRIBUTE_COLORS[slot.ability.attribute];
+  // ZONE: 플레이어 중심 범위 내 모든 적 즉시 피해. areaScale은 Overheat 적용값.
+  private fireZoneAbility(slot: AbilitySlot, stats: LevelStats, baseDmg: number, areaScale = 1): void {
+    const radius = (stats.area ?? 80) * areaScale;
+    const color  = ATTRIBUTE_COLORS[slot.ability.attribute];
     const toKill: Enemy[] = [];
 
     for (const child of this.enemyGroup.getChildren()) {
       const enemy = child as Enemy;
       if (!enemy.active) continue;
-      const dist = Phaser.Math.Distance.Between(
-        this.player.x, this.player.y, enemy.x, enemy.y,
-      );
-      if (dist > radius) continue;
+      if (Phaser.Math.Distance.Between(this.player.x, this.player.y, enemy.x, enemy.y) > radius) continue;
 
       const isCrit = Math.random() < CRIT_CHANCE;
       const result = calculate({
@@ -455,9 +528,7 @@ export class GameScene extends Phaser.Scene {
 
     toKill.forEach(e => this.onEnemyDeath(e));
 
-    // Holy Nova: 회복 (CLAUDE.md §13)
     if (stats.healAmount) this.player.heal(stats.healAmount);
-
     this.showZoneEffect(this.player.x, this.player.y, radius, color);
   }
 
@@ -467,45 +538,30 @@ export class GameScene extends Phaser.Scene {
     const pierce  = stats.pierce ?? slot.ability.attackShape?.pierce ?? 0;
     const speed   = slot.ability.attackShape?.speed ?? 300;
     const texKey  = `proj_${slot.ability.attribute.toLowerCase()}_tex`;
-    const targets = this.findNearestEnemies(count);
-
-    for (const target of targets) {
+    for (const target of this.findNearestEnemies(count)) {
       this.fireProjectile(
-        this.player.x, this.player.y,
-        target.x, target.y,
-        projDmg,
-        slot.ability.attribute,
-        speed,
-        pierce,
-        texKey,
+        this.player.x, this.player.y, target.x, target.y,
+        projDmg, slot.ability.attribute, speed, pierce, texKey,
       );
     }
   }
 
-  // MELEE_HIT: 마지막 이동 방향 기준 ±90° 부채꼴 범위 내 적에게 피해.
-  private fireMeleeHitAbility(slot: AbilitySlot, stats: LevelStats, baseDmg: number): void {
-    const radius  = stats.area ?? 70;
-    const color   = ATTRIBUTE_COLORS[slot.ability.attribute];
-    const dirAngle = Math.atan2(
-      this.player.lastDirectionY,
-      this.player.lastDirectionX,
-    );
-    const halfArc = Math.PI / 2; // ±90°
+  // MELEE_HIT: 마지막 이동 방향 기준 ±90° 부채꼴 내 적에게 피해.
+  private fireMeleeHitAbility(slot: AbilitySlot, stats: LevelStats, baseDmg: number, areaScale = 1): void {
+    const radius   = (stats.area ?? 70) * areaScale;
+    const color    = ATTRIBUTE_COLORS[slot.ability.attribute];
+    const dirAngle = Math.atan2(this.player.lastDirectionY, this.player.lastDirectionX);
+    const halfArc  = Math.PI / 2;
     const toKill: Enemy[] = [];
 
     for (const child of this.enemyGroup.getChildren()) {
       const enemy = child as Enemy;
       if (!enemy.active) continue;
-      const dist = Phaser.Math.Distance.Between(
-        this.player.x, this.player.y, enemy.x, enemy.y,
-      );
+      const dist = Phaser.Math.Distance.Between(this.player.x, this.player.y, enemy.x, enemy.y);
       if (dist > radius) continue;
 
-      const toEnemy = Phaser.Math.Angle.Between(
-        this.player.x, this.player.y, enemy.x, enemy.y,
-      );
-      const diff = Phaser.Math.Angle.Wrap(toEnemy - dirAngle);
-      if (Math.abs(diff) > halfArc) continue;
+      const toEnemy = Phaser.Math.Angle.Between(this.player.x, this.player.y, enemy.x, enemy.y);
+      if (Math.abs(Phaser.Math.Angle.Wrap(toEnemy - dirAngle)) > halfArc) continue;
 
       const isCrit = Math.random() < CRIT_CHANCE;
       const result = calculate({
@@ -524,24 +580,18 @@ export class GameScene extends Phaser.Scene {
     this.showMeleeHitEffect(this.player.x, this.player.y, radius, dirAngle, color);
   }
 
-  // ZONE 시각 이펙트: 속성 색상 원 + 알파 트윈.
+  // ── 시각 이펙트 ──────────────────────────────────────────
+
   private showZoneEffect(x: number, y: number, radius: number, color: number): void {
     const g = this.add.graphics();
     g.fillStyle(color, 0.3);
     g.fillCircle(x, y, radius);
     g.lineStyle(2, color, 0.8);
     g.strokeCircle(x, y, radius);
-    this.tweens.add({
-      targets: g, alpha: 0, duration: 280,
-      onComplete: () => g.destroy(),
-    });
+    this.tweens.add({ targets: g, alpha: 0, duration: 280, onComplete: () => g.destroy() });
   }
 
-  // MELEE_HIT 시각 이펙트: 부채꼴(±90°) + 알파 트윈.
-  private showMeleeHitEffect(
-    x: number, y: number,
-    radius: number, angle: number, color: number,
-  ): void {
+  private showMeleeHitEffect(x: number, y: number, radius: number, angle: number, color: number): void {
     const g       = this.add.graphics();
     const halfArc = Math.PI / 2;
     const steps   = 12;
@@ -549,14 +599,26 @@ export class GameScene extends Phaser.Scene {
     g.beginPath();
     g.moveTo(x, y);
     for (let i = 0; i <= steps; i++) {
-      const a = (angle - halfArc) + (i / steps) * (halfArc * 2);
+      const a = (angle - halfArc) + (i / steps) * halfArc * 2;
       g.lineTo(x + Math.cos(a) * radius, y + Math.sin(a) * radius);
     }
     g.closePath();
     g.fillPath();
+    this.tweens.add({ targets: g, alpha: 0, duration: 180, onComplete: () => g.destroy() });
+  }
+
+  // 적 사망 시 Relic Box 시각 표시 (임시: 빈 상자 3초 후 페이드)
+  private showRelicBoxDrop(x: number, y: number): void {
+    const g = this.add.graphics().setDepth(20);
+    g.fillStyle(0x9900ff, 1);
+    g.fillRect(x - 14, y - 14, 28, 28);
+    g.lineStyle(2, 0xffdd44, 1);
+    g.strokeRect(x - 14, y - 14, 28, 28);
+    const t = this.add.text(x, y, '?', { fontSize: '18px', color: '#ffdd44' })
+      .setOrigin(0.5).setDepth(21);
     this.tweens.add({
-      targets: g, alpha: 0, duration: 180,
-      onComplete: () => g.destroy(),
+      targets: [g, t], alpha: 0, delay: 2000, duration: 600,
+      onComplete: () => { g.destroy(); t.destroy(); },
     });
   }
 
@@ -565,16 +627,14 @@ export class GameScene extends Phaser.Scene {
   private updateXPOrbAttraction(): void {
     for (const child of this.xpOrbGroup.getChildren()) {
       const orb = child as XPOrb;
-      if (!orb.active) continue;
-      orb.updateAttraction(this.player.x, this.player.y, XP_ABSORB_RADIUS, XP_ABSORB_SPEED);
+      if (orb.active) orb.updateAttraction(this.player.x, this.player.y, XP_ABSORB_RADIUS, XP_ABSORB_SPEED);
     }
   }
 
   private updateHPOrbAttraction(): void {
     for (const child of this.hpOrbGroup.getChildren()) {
       const orb = child as HPOrb;
-      if (!orb.active) continue;
-      orb.updateAttraction(this.player.x, this.player.y, HP_ABSORB_RADIUS, HP_ABSORB_SPEED);
+      if (orb.active) orb.updateAttraction(this.player.x, this.player.y, HP_ABSORB_RADIUS, HP_ABSORB_SPEED);
     }
   }
 
@@ -582,90 +642,67 @@ export class GameScene extends Phaser.Scene {
 
   private cleanupOutOfBoundsProjectiles(): void {
     const { width, height } = this.scale;
-
     for (const child of this.projectileGroup.getChildren()) {
       const proj = child as Projectile;
-      if (!proj.active) continue;
-      if (proj.x < 0 || proj.x > width || proj.y < 0 || proj.y > height) {
-        proj.deactivate();
-        this.projectilePool.release(proj);
+      if (proj.active && (proj.x < 0 || proj.x > width || proj.y < 0 || proj.y > height)) {
+        proj.deactivate(); this.projectilePool.release(proj);
       }
     }
-
     for (const child of this.enemyProjectileGroup.getChildren()) {
       const proj = child as Projectile;
-      if (!proj.active) continue;
-      if (proj.x < 0 || proj.x > width || proj.y < 0 || proj.y > height) {
-        proj.deactivate();
-        this.enemyProjectilePool.release(proj);
+      if (proj.active && (proj.x < 0 || proj.x > width || proj.y < 0 || proj.y > height)) {
+        this.shockwaveSet.delete(proj);
+        proj.deactivate(); this.enemyProjectilePool.release(proj);
       }
     }
   }
 
   // ── 전투 헬퍼 ─────────────────────────────────────────────
 
-  // 활성 Enemy 중 가장 가까운 1명. Normal Attack 조준용.
   private findNearestEnemy(): Enemy | null {
     let nearest: Enemy | null = null;
     let minDist = Infinity;
     for (const child of this.enemyGroup.getChildren()) {
       const enemy = child as Enemy;
       if (!enemy.active) continue;
-      const dist = Phaser.Math.Distance.Between(
-        this.player.x, this.player.y, enemy.x, enemy.y,
-      );
-      if (dist < minDist) { minDist = dist; nearest = enemy; }
+      const d = Phaser.Math.Distance.Between(this.player.x, this.player.y, enemy.x, enemy.y);
+      if (d < minDist) { minDist = d; nearest = enemy; }
     }
     return nearest;
   }
 
-  // 활성 Enemy를 거리 오름차순 정렬 후 count명 반환. Ability 자동 조준용.
   private findNearestEnemies(count: number): Enemy[] {
     const list: Array<{ enemy: Enemy; dist: number }> = [];
     for (const child of this.enemyGroup.getChildren()) {
       const enemy = child as Enemy;
       if (!enemy.active) continue;
-      const dist = Phaser.Math.Distance.Between(
-        this.player.x, this.player.y, enemy.x, enemy.y,
-      );
-      list.push({ enemy, dist });
+      list.push({ enemy, dist: Phaser.Math.Distance.Between(this.player.x, this.player.y, enemy.x, enemy.y) });
     }
-    list.sort((a, b) => a.dist - b.dist);
-    return list.slice(0, count).map(e => e.enemy);
+    return list.sort((a, b) => a.dist - b.dist).slice(0, count).map(e => e.enemy);
   }
 
-  // 풀에서 Projectile을 꺼내 지정 방향으로 발사.
   private fireProjectile(
-    fromX: number, fromY: number,
-    toX: number,   toY: number,
-    damage: number | null,
-    attribute: Attribute,
-    speed: number,
-    pierce: number,
-    textureKey: string,
+    fromX: number, fromY: number, toX: number, toY: number,
+    damage: number | null, attribute: Attribute,
+    speed: number, pierce: number, textureKey: string,
   ): void {
     if (!damage) return;
     const proj  = this.projectilePool.get();
     const angle = Phaser.Math.Angle.Between(fromX, fromY, toX, toY);
-    proj.activate(
-      fromX, fromY,
-      Math.cos(angle) * speed,
-      Math.sin(angle) * speed,
-      damage,
-      attribute,
-      pierce,
-      textureKey,
-    );
+    proj.activate(fromX, fromY, Math.cos(angle) * speed, Math.sin(angle) * speed, damage, attribute, pierce, textureKey);
   }
 
-  // 적 처치: 비활성화 → DropManager로 드롭 결정 → 오브 스폰 + Gold 적립.
-  private onEnemyDeath(enemy: Enemy): void {
-    const data = enemy.enemyData;
-    const x    = enemy.x;
-    const y    = enemy.y;
+  // ── 적 처치 ───────────────────────────────────────────────
 
-    // Spitter 타이머 정리
+  private onEnemyDeath(enemy: Enemy): void {
+    const data       = enemy.enemyData;
+    const x          = enemy.x;
+    const y          = enemy.y;
+    const isChampion = this.championSet.has(enemy);
+
     this.spitterTimers.delete(enemy);
+    this.championSet.delete(enemy);
+    this.championTimers.delete(enemy);
 
     enemy.deactivate();
     this.enemyPool.release(enemy);
@@ -674,29 +711,29 @@ export class GameScene extends Phaser.Scene {
 
     const drops = DropManager.computeDrops(data);
 
-    // XP 오브 (항상 드롭)
     const xpOrb = this.xpOrbPool.get();
     xpOrb.activate(x, y, drops.xpAmount);
 
-    // HP 오브 (확률 드롭)
     if (drops.hpHealPercent !== null) {
       const hpOrb = this.hpOrbPool.get();
       hpOrb.activate(x, y, drops.hpHealPercent);
     }
 
-    // Gold
     this.playerGold += drops.goldAmount;
+
+    if (isChampion) this.showRelicBoxDrop(x, y);
   }
 
   // ── Physics Overlap 콜백 ──────────────────────────────────
 
-  // 플레이어 투사체 → 적: DamageCalculator 경유 피해.
   private handleProjectileHitEnemy(proj: Projectile, enemy: Enemy): void {
     if (!proj.active || !enemy.active) return;
 
-    const isCrit = Math.random() < CRIT_CHANCE;
-    const result = calculate({
-      baseDamage:        proj.damage * this.player.characterData.damageMultiplier,
+    const attrBonus  = this.attributeDmgBonuses.get(proj.attribute) ?? 0;
+    const attrFactor = 1 + attrBonus / 100;
+    const isCrit     = Math.random() < CRIT_CHANCE;
+    const result     = calculate({
+      baseDamage:        proj.damage * this.player.characterData.damageMultiplier * attrFactor,
       attribute:         proj.attribute,
       attackerTags:      { attribute: proj.attribute },
       targetResistances: enemy.resistances,
@@ -706,40 +743,26 @@ export class GameScene extends Phaser.Scene {
     });
 
     const isDead = enemy.takeDamage(result.finalDamage);
-
-    if (proj.onHit()) {
-      proj.deactivate();
-      this.projectilePool.release(proj);
-    }
-
+    if (proj.onHit()) { proj.deactivate(); this.projectilePool.release(proj); }
     if (isDead) this.onEnemyDeath(enemy);
   }
 
-  // 적 접촉 → 플레이어: 무적시간 포함 피해.
   private handlePlayerHitEnemy(enemy: Enemy): void {
     if (!enemy.active) return;
-
     const isCrit = Math.random() < CRIT_CHANCE;
     const result = calculate({
-      baseDamage:        enemy.contactDamage,
-      attribute:         'PHYSICAL',
-      attackerTags:      {},
-      targetResistances: [],
-      targetSpecialTags: [],
-      isCritical:        isCrit,
-      critMultiplier:    CRIT_MULTIPLIER,
+      baseDamage: enemy.contactDamage, attribute: 'PHYSICAL',
+      attackerTags: {}, targetResistances: [], targetSpecialTags: [],
+      isCritical: isCrit, critMultiplier: CRIT_MULTIPLIER,
     });
-
     this.player.takeDamage(result.finalDamage, this.time.now);
   }
 
-  // XP 오브 → 플레이어: XP 수집 + 레벨업 체크.
   private handlePlayerCollectXP(orb: XPOrb): void {
     if (!orb.active) return;
     this.playerXP += orb.xpAmount;
     orb.deactivate();
     this.xpOrbPool.release(orb);
-
     const threshold = this.getXPThreshold(this.playerLevel);
     if (this.playerXP >= threshold && !this.isLevelingUp) {
       this.playerXP -= threshold;
@@ -747,7 +770,6 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
-  // HP 오브 → 플레이어: maxHp × healPercent 회복.
   private handlePlayerCollectHP(orb: HPOrb): void {
     if (!orb.active) return;
     this.player.heal(Math.floor(this.player.maxHp * orb.healPercent));
@@ -755,23 +777,31 @@ export class GameScene extends Phaser.Scene {
     this.hpOrbPool.release(orb);
   }
 
-  // 적 투사체 → 플레이어: DamageCalculator 경유 피해.
-  // damageMultiplier 미적용 (incoming 피해에는 플레이어 공격력 배율 불필요).
+  // 적 투사체 → 플레이어. 충격파면 넉백 추가 적용.
   private handleEnemyProjectileHitPlayer(proj: Projectile): void {
     if (!proj.active) return;
 
+    // velocity는 deactivate() 전에 읽어야 함
+    const body         = proj.body as Phaser.Physics.Arcade.Body;
+    const vx           = body.velocity.x;
+    const vy           = body.velocity.y;
+    const isShockwave  = this.shockwaveSet.has(proj);
+
     const isCrit = Math.random() < CRIT_CHANCE;
     const result = calculate({
-      baseDamage:        proj.damage,
-      attribute:         proj.attribute,
-      attackerTags:      {},
-      targetResistances: [],
-      targetSpecialTags: [],
-      isCritical:        isCrit,
-      critMultiplier:    CRIT_MULTIPLIER,
+      baseDamage: proj.damage, attribute: proj.attribute,
+      attackerTags: {}, targetResistances: [], targetSpecialTags: [],
+      isCritical: isCrit, critMultiplier: CRIT_MULTIPLIER,
     });
 
     this.player.takeDamage(result.finalDamage, this.time.now);
+
+    if (isShockwave) {
+      const len = Math.sqrt(vx * vx + vy * vy) || 1;
+      this.player.applyKnockback((vx / len) * 350, (vy / len) * 350, 250, this.time.now);
+      this.shockwaveSet.delete(proj);
+    }
+
     proj.deactivate();
     this.enemyProjectilePool.release(proj);
   }
@@ -786,10 +816,7 @@ export class GameScene extends Phaser.Scene {
     this.isLevelingUp = true;
     this.physics.pause();
     this.playerLevel++;
-
-    // 레벨업 시 최대 HP 10% 회복 (CLAUDE.md §13)
     this.player.heal(Math.floor(this.player.maxHp * 0.1));
-
     const choices = this.levelUpManager.generateChoices(3, this.abilityManager, this.playerLevel);
     this.levelUpUI.show(
       choices,
@@ -801,7 +828,7 @@ export class GameScene extends Phaser.Scene {
 
   private handleLevelUpChoice(choice: Choice): void {
     if (choice.type === 'ATTRIBUTE_CARD') {
-      // AttributeCard 실제 효과 적용은 Block 5 예정
+      this.applyAttributeCard(choice.data);
       this.pendingAbility = null;
       this.levelUpUI.hide();
       this.resumeFromLevelUp();
@@ -809,7 +836,6 @@ export class GameScene extends Phaser.Scene {
     }
 
     const ability = choice.data;
-
     if (this.abilityManager.hasAbility(ability.id)) {
       this.abilityManager.addStack(ability.id);
       this.pendingAbility = null;
@@ -821,7 +847,6 @@ export class GameScene extends Phaser.Scene {
       this.levelUpUI.hide();
       this.resumeFromLevelUp();
     } else {
-      // 슬롯 꽉 참 → Discard 대기
       this.pendingAbility = ability;
     }
   }
@@ -830,7 +855,6 @@ export class GameScene extends Phaser.Scene {
     this.abilityManager.removeFromSlot(abilityId);
     this.abilityManager.ban(abilityId, this.playerLevel + 5);
     this.levelUpManager.checkFallback(this.abilityManager, this.playerLevel);
-
     if (this.pendingAbility) {
       this.abilityManager.equip(this.pendingAbility);
       this.pendingAbility = null;
@@ -844,77 +868,156 @@ export class GameScene extends Phaser.Scene {
     this.physics.resume();
   }
 
-  // ── 스폰 ──────────────────────────────────────────────────
-
-  // 16마리 테스트 스폰: Grunt×8, ArmoredGrunt×5, Spitter×3
-  // Block 5에서 WaveManager로 교체 예정.
-  private spawnTestEnemies(): void {
-    const { width, height } = this.scale;
-    for (let i = 0; i < TEST_SPAWN_COUNT; i++) {
-      let x: number, y: number;
-      do {
-        x = Phaser.Math.Between(50, width  - 50);
-        y = Phaser.Math.Between(50, height - 50);
-      } while (Phaser.Math.Distance.Between(x, y, width / 2, height / 2) < MIN_SPAWN_DIST);
-
-      let data: EnemyData;
-      if (i < 8)       data = GRUNT_DATA;
-      else if (i < 13) data = ARMORED_GRUNT_DATA;
-      else             data = SPITTER_DATA;
-
-      this.spawnEnemy(x, y, data);
+  // Attribute Card 효과 적용 (damage PERCENT 카드만 즉시 반영)
+  private applyAttributeCard(card: AttributeCard): void {
+    if (card.statKey === 'damage' && card.valueType === 'PERCENT') {
+      const prev = this.attributeDmgBonuses.get(card.attribute) ?? 0;
+      this.attributeDmgBonuses.set(card.attribute, prev + card.value);
     }
   }
+
+  // ── Champion 스폰 ─────────────────────────────────────────
+
+  private checkChampionSpawn(): void {
+    for (let i = 0; i < CHAMPION_CHECK_TIMES.length; i++) {
+      if (!this.championCheckDone[i] && this.stageElapsedSeconds >= CHAMPION_CHECK_TIMES[i]) {
+        this.championCheckDone[i] = true;
+        if (Math.random() < CHAMPION_SPAWN_CHANCE) this.spawnChampion();
+      }
+    }
+  }
+
+  private spawnChampion(): void {
+    const { width, height } = this.scale;
+    const pad  = 40;
+    const side = Math.floor(Math.random() * 4);
+    let x: number, y: number;
+    switch (side) {
+      case 0:  x = Phaser.Math.Between(0, width); y = -pad;           break;
+      case 1:  x = Phaser.Math.Between(0, width); y = height + pad;   break;
+      case 2:  x = -pad; y = Phaser.Math.Between(0, height);          break;
+      default: x = width + pad; y = Phaser.Math.Between(0, height);   break;
+    }
+    const enemy = this.enemyPool.get();
+    enemy.activate(x, y, STONE_WARDEN_DATA);
+    this.championSet.add(enemy);
+  }
+
+  // ── 스폰 ──────────────────────────────────────────────────
 
   private spawnEnemy(x: number, y: number, data: EnemyData): void {
     const enemy = this.enemyPool.get();
     enemy.activate(x, y, data);
   }
 
+  // ── 게임 종료 / 스테이지 클리어 ──────────────────────────
+
+  private triggerGameOver(): void {
+    this.isGameOver = true;
+    this.physics.pause();
+    if (this.scene.isActive('UIScene')) this.scene.stop('UIScene');
+    this.showGameOverScreen();
+  }
+
+  private showGameOverScreen(): void {
+    const { width, height } = this.scale;
+    this.add.rectangle(width / 2, height / 2, width, height, 0x000000, 0.75).setDepth(100);
+    this.add.text(width / 2, height / 2 - 90, 'GAME OVER', {
+      fontSize: '52px', color: '#ff4444', fontStyle: 'bold',
+    }).setOrigin(0.5).setDepth(101);
+
+    const m = Math.floor(this.stageElapsedSeconds / 60);
+    const s = Math.floor(this.stageElapsedSeconds % 60);
+    this.add.text(width / 2, height / 2 - 10, `생존 시간: ${m}:${String(s).padStart(2, '0')}`, {
+      fontSize: '22px', color: '#ffffff',
+    }).setOrigin(0.5).setDepth(101);
+    this.add.text(width / 2, height / 2 + 30, `Gold: ${this.playerGold}`, {
+      fontSize: '22px', color: '#ffdd44',
+    }).setOrigin(0.5).setDepth(101);
+
+    const btn = this.add.rectangle(width / 2, height / 2 + 90, 170, 48, 0x444466)
+      .setDepth(101).setInteractive({ useHandCursor: true });
+    this.add.text(width / 2, height / 2 + 90, '다시 시작', { fontSize: '22px', color: '#ffffff' })
+      .setOrigin(0.5).setDepth(102);
+    btn.on('pointerover',  () => btn.setFillStyle(0x6666aa));
+    btn.on('pointerout',   () => btn.setFillStyle(0x444466));
+    btn.on('pointerup',    () => { this.scene.stop('UIScene'); this.scene.restart(); });
+  }
+
+  private showStageComplete(): void {
+    this.stageCompleted = true;
+    this.physics.pause();
+    if (this.scene.isActive('UIScene')) this.scene.stop('UIScene');
+
+    const { width, height } = this.scale;
+    this.add.rectangle(width / 2, height / 2, width, height, 0x000000, 0.75).setDepth(100);
+    this.add.text(width / 2, height / 2 - 90, 'STAGE CLEAR!', {
+      fontSize: '52px', color: '#ffdd44', fontStyle: 'bold',
+    }).setOrigin(0.5).setDepth(101);
+
+    const m = Math.floor(this.stageElapsedSeconds / 60);
+    const s = Math.floor(this.stageElapsedSeconds % 60);
+    this.add.text(width / 2, height / 2 - 10, `클리어 시간: ${m}:${String(s).padStart(2, '0')}`, {
+      fontSize: '22px', color: '#ffffff',
+    }).setOrigin(0.5).setDepth(101);
+    this.add.text(width / 2, height / 2 + 30, `Gold: ${this.playerGold}`, {
+      fontSize: '22px', color: '#ffdd44',
+    }).setOrigin(0.5).setDepth(101);
+
+    const btn = this.add.rectangle(width / 2, height / 2 + 90, 170, 48, 0x446644)
+      .setDepth(101).setInteractive({ useHandCursor: true });
+    this.add.text(width / 2, height / 2 + 90, '다시 시작', { fontSize: '22px', color: '#ffffff' })
+      .setOrigin(0.5).setDepth(102);
+    btn.on('pointerover', () => btn.setFillStyle(0x66aa66));
+    btn.on('pointerout',  () => btn.setFillStyle(0x446644));
+    btn.on('pointerup',   () => { this.scene.stop('UIScene'); this.scene.restart(); });
+  }
+
   // ── 텍스처 생성 ───────────────────────────────────────────
 
-  // 에셋 파일 없이 Phaser Graphics 도형으로 모든 텍스처 생성 (CLAUDE.md §16).
   private generateGameTextures(): void {
     // Grunt: 빨간 원
     if (!this.textures.exists('grunt_tex')) {
       const g = this.make.graphics();
-      g.fillStyle(0xff2222, 1);
-      g.fillCircle(18, 18, 18);
-      g.generateTexture('grunt_tex', 36, 36);
-      g.destroy();
+      g.fillStyle(0xff2222, 1); g.fillCircle(18, 18, 18);
+      g.generateTexture('grunt_tex', 36, 36); g.destroy();
     }
-
     // ArmoredGrunt: 회색 사각형 + 테두리
     if (!this.textures.exists('armored_grunt_tex')) {
       const g = this.make.graphics();
-      g.fillStyle(0x888888, 1);
-      g.fillRect(2, 2, 32, 32);
-      g.lineStyle(2, 0xbbbbbb, 1);
-      g.strokeRect(2, 2, 32, 32);
-      g.generateTexture('armored_grunt_tex', 36, 36);
-      g.destroy();
+      g.fillStyle(0x888888, 1); g.fillRect(2, 2, 32, 32);
+      g.lineStyle(2, 0xbbbbbb, 1); g.strokeRect(2, 2, 32, 32);
+      g.generateTexture('armored_grunt_tex', 36, 36); g.destroy();
     }
-
     // Spitter: 주황색 삼각형
     if (!this.textures.exists('spitter_tex')) {
       const g = this.make.graphics();
-      g.fillStyle(0xff8800, 1);
-      g.fillTriangle(16, 0, 32, 32, 0, 32);
-      g.generateTexture('spitter_tex', 32, 32);
-      g.destroy();
+      g.fillStyle(0xff8800, 1); g.fillTriangle(16, 0, 32, 32, 0, 32);
+      g.generateTexture('spitter_tex', 32, 32); g.destroy();
     }
-
+    // Stone Warden: 크고 밝은 보라색 원 + 테두리 (Champion)
+    if (!this.textures.exists('stone_warden_tex')) {
+      const r = 28;
+      const g = this.make.graphics();
+      g.fillStyle(0xaa44ff, 1); g.fillCircle(r + 2, r + 2, r);
+      g.lineStyle(3, 0xffaaff, 1); g.strokeCircle(r + 2, r + 2, r);
+      g.generateTexture('stone_warden_tex', (r + 2) * 2, (r + 2) * 2); g.destroy();
+    }
     // HP 오브: 빨간 십자
     if (!this.textures.exists('hp_orb_tex')) {
       const g = this.make.graphics();
       g.fillStyle(0xff2222, 1);
-      g.fillRect(2, 7, 16, 6);   // 가로 바
-      g.fillRect(7, 2, 6, 16);   // 세로 바
-      g.generateTexture('hp_orb_tex', 20, 20);
-      g.destroy();
+      g.fillRect(2, 7, 16, 6); g.fillRect(7, 2, 6, 16);
+      g.generateTexture('hp_orb_tex', 20, 20); g.destroy();
     }
-
-    // 속성별 투사체 텍스처: 'proj_{attribute소문자}_tex'
+    // 충격파: 주황 원 (일반 투사체보다 큼)
+    if (!this.textures.exists('shockwave_tex')) {
+      const g = this.make.graphics();
+      g.fillStyle(0xff8800, 0.9); g.fillCircle(12, 12, 12);
+      g.lineStyle(2, 0xffdd44, 1); g.strokeCircle(12, 12, 12);
+      g.generateTexture('shockwave_tex', 24, 24); g.destroy();
+    }
+    // 속성별 투사체 텍스처
     const projDefs: Array<{ key: string; color: number }> = [
       { key: 'proj_fire_tex',      color: ATTRIBUTE_COLORS.FIRE      },
       { key: 'proj_frost_tex',     color: ATTRIBUTE_COLORS.FROST     },
@@ -927,20 +1030,15 @@ export class GameScene extends Phaser.Scene {
     for (const { key, color } of projDefs) {
       if (!this.textures.exists(key)) {
         const g = this.make.graphics();
-        g.fillStyle(color, 1);
-        g.fillCircle(6, 6, 6);
-        g.generateTexture(key, 12, 12);
-        g.destroy();
+        g.fillStyle(color, 1); g.fillCircle(6, 6, 6);
+        g.generateTexture(key, 12, 12); g.destroy();
       }
     }
-
     // XP 오브: 초록 원
     if (!this.textures.exists('xp_orb_tex')) {
       const g = this.make.graphics();
-      g.fillStyle(0x44ff44, 1);
-      g.fillCircle(6, 6, 6);
-      g.generateTexture('xp_orb_tex', 12, 12);
-      g.destroy();
+      g.fillStyle(0x44ff44, 1); g.fillCircle(6, 6, 6);
+      g.generateTexture('xp_orb_tex', 12, 12); g.destroy();
     }
   }
 }

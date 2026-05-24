@@ -86,9 +86,29 @@ export const SPITTER_DATA: EnemyData = {
   specialTags: [],
 };
 
+// ──────────────────────────────────────────────
+// Stone Warden — Champion 등급 (Block 5 구현)
+// ARMORED 태그. 전방 충격파(넉백) + HP 50% 이하 시 이속 증가.
+// 처치 시 Relic Box 드롭 보장.
+// ──────────────────────────────────────────────
+export const STONE_WARDEN_DATA: EnemyData = {
+  id:         'stone_warden',
+  name:       'Stone Warden',
+  grade:      'CHAMPION',
+  hp:         400,      // 임시값
+  moveSpeed:  60,       // 임시값
+  damage:     20,       // 임시값
+  xpReward:   80,       // 임시값
+  bodyRadius: 28,       // 일반 몹 1.5배 크기
+  textureKey: 'stone_warden_tex',
+  resistances: [],
+  specialTags: ['ARMORED'],
+};
+
 // WaveManager(Block 4)에서 id로 데이터를 조회할 때 사용
 export const ENEMY_DATA_MAP: Record<string, EnemyData> = {
   grunt:         GRUNT_DATA,
   armored_grunt: ARMORED_GRUNT_DATA,
   spitter:       SPITTER_DATA,
+  stone_warden:  STONE_WARDEN_DATA,
 };

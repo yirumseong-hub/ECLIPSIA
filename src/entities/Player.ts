@@ -57,6 +57,11 @@ export class Player extends Phaser.Physics.Arcade.Sprite {
   // ── 내부 상태 ────────────────────────────────────────
   private invincibleUntil: number = 0; // Phaser 누적 시간(ms) 기준
 
+  // Champion 충격파 등의 넉백 상태
+  private knockbackUntil: number = 0;
+  private knockbackVx:    number = 0;
+  private knockbackVy:    number = 0;
+
   constructor(
     scene: Phaser.Scene,
     x: number,
@@ -118,6 +123,14 @@ export class Player extends Phaser.Physics.Arcade.Sprite {
     return time < this.invincibleUntil;
   }
 
+  // Champion 충격파 등 피격 시 넉백 적용.
+  // duration ms 동안 handleMovement의 일반 이동을 덮어쓴다.
+  applyKnockback(vx: number, vy: number, duration: number, time: number): void {
+    this.knockbackVx    = vx;
+    this.knockbackVy    = vy;
+    this.knockbackUntil = time + duration;
+  }
+
   // Ara 고유 패시브: 광기의 불꽃.
   // AbilityManager에서 현재 장착된 FIRE Ability 수를 전달받아 보너스 배율 반환.
   // DamageCalculator.calculate() 호출 전에 호출하여 baseDamage에 곱함.
@@ -131,7 +144,7 @@ export class Player extends Phaser.Physics.Arcade.Sprite {
 
   // GameScene.update(time, delta) → 이 메서드 호출.
   update(cursors: Phaser.Types.Input.Keyboard.CursorKeys, wasd: WASDKeys, time: number, delta: number): void {
-    this.handleMovement(cursors, wasd);
+    this.handleMovement(cursors, wasd, time);
     this.updateInvincibilityVisual(time);
 
     // 고유 메카닉 업데이트 (null이면 스킵)
@@ -142,8 +155,15 @@ export class Player extends Phaser.Physics.Arcade.Sprite {
 
   // WASD + 방향키 이동 처리.
   // 대각선 이동 시 속도를 정규화(√0.5 ≈ 0.707)하여 일정하게 유지.
-  private handleMovement(cursors: Phaser.Types.Input.Keyboard.CursorKeys, wasd: WASDKeys): void {
+  private handleMovement(cursors: Phaser.Types.Input.Keyboard.CursorKeys, wasd: WASDKeys, time: number): void {
     const body  = this.body as Phaser.Physics.Arcade.Body;
+
+    // 넉백 중: 일반 이동 억제 후 넉백 속도 유지
+    if (time < this.knockbackUntil) {
+      body.setVelocity(this.knockbackVx, this.knockbackVy);
+      return;
+    }
+
     const speed = this.characterData.moveSpeed;
 
     const left  = cursors.left.isDown  || wasd.left.isDown;
