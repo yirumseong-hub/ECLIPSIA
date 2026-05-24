@@ -48,6 +48,12 @@ export class Player extends Phaser.Physics.Arcade.Sprite {
   // HUD에서 getGaugeValue()/getGaugeMax()로 게이지 표시.
   readonly mechanic: IMechanic | null;
 
+  // ── DIRECTIONAL Ability 발사 방향 추적 ───────────────────
+  // Slash 등 DIRECTIONAL Ability 발사 시 기준 방향 (CLAUDE.md §17).
+  // 입력 없을 때는 마지막 이동 방향 유지.
+  lastDirectionX: number = 1;
+  lastDirectionY: number = 0;
+
   // ── 내부 상태 ────────────────────────────────────────
   private invincibleUntil: number = 0; // Phaser 누적 시간(ms) 기준
 
@@ -159,6 +165,14 @@ export class Player extends Phaser.Physics.Arcade.Sprite {
     }
 
     body.setVelocity(vx, vy);
+
+    // 마지막 이동 방향 갱신 (DIRECTIONAL Ability 발사 기준)
+    const dirX = (right ? 1 : 0) - (left ? 1 : 0);
+    const dirY = (down  ? 1 : 0) - (up   ? 1 : 0);
+    if (dirX !== 0 || dirY !== 0) {
+      this.lastDirectionX = dirX;
+      this.lastDirectionY = dirY;
+    }
   }
 
   // 무적 시간 중 알파 깜빡임 피드백.
